@@ -1,0 +1,226 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Uber Detour (Web)</title>
+  <style>
+    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Arial; margin: 0; background:#f5f5f5; }
+    .wrap { max-width: 720px; margin: 0 auto; padding: 24px; }
+    .card { background:#fff; border-radius: 14px; padding: 16px; box-shadow: 0 2px 10px rgba(0,0,0,.06); }
+    h1 { margin: 0 0 6px; font-size: 24px; }
+    p { margin: 6px 0 14px; color:#555; }
+    label { display:block; margin: 10px 0 6px; font-weight: 600; }
+    input { width:100%; padding: 12px; border:1px solid #ddd; border-radius: 10px; font-size: 15px; }
+    .row { display:flex; gap: 10px; flex-wrap: wrap; }
+    button { border:0; border-radius: 12px; padding: 12px 14px; font-weight: 700; cursor:pointer; }
+    .btn-primary { background:#000; color:#fff; width:100%; margin-top: 12px; }
+    .btn-secondary { background:#ff6a00; color:#fff; flex:1; min-width: 160px; }
+    .btn-ghost { background:#eee; color:#111; flex:1; min-width: 160px; }
+    .muted { font-size: 12px; color:#777; margin-top: 10px; }
+    .hr { height:1px; background:#eee; margin: 14px 0; }
+    .route { line-height: 1.35; font-size: 14px; }
+    .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace; font-size: 12px; color:#333; }
+    .status { margin-top: 10px; font-size: 13px; color:#333; }
+    .warn { color:#8a5a00; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="card">
+      <h1>Uber Detour (Web)</h1>
+      <p>Enter origin & destination. We generate a random nearby detour stop and open Uber.</p>
+
+      <label>Origin</label>
+      <input id="origin" placeholder="e.g., Harrison, NJ" />
+
+      <label>Destination</label>
+      <input id="dest" placeholder="e.g., JFK Airport, New York" />
+
+      <div class="row" style="margin-top:10px;">
+        <button class="btn-ghost" id="newStop" disabled>↻ New Random Stop</button>
+        <button class="btn-ghost" id="clear">Clear</button>
+      </div>
+
+      <button class="btn-primary" id="generate">Generate Detour</button>
+
+      <div class="status" id="status"></div>
+
+      <div id="result" style="display:none; margin-top:14px;">
+        <div class="hr"></div>
+        <div class="route" id="routeText"></div>
+        <div class="mono" id="coordsText" style="margin-top:10px;"></div>
+
+        <div class="hr"></div>
+
+        <div class="row">
+          <button class="btn-secondary" id="fullRoute">Open Full Route (Beta)</button>
+          <button class="btn-secondary" id="leg1">Leg 1: A → Stop</button>
+          <button class="btn-secondary" id="leg2">Leg 2: Stop → B</button>
+        </div>
+
+        <div class="muted warn">
+          ⚠ Uber multi-stop prefilling can be inconsistent on some devices/app versions.
+          If the stop is missing, use Leg 1 + Leg 2.
+        </div>
+      </div>
+
+      <div class="muted">
+        Uses OpenStreetMap Nominatim for geocoding (addresses are sent to Nominatim).
+      </div>
+    </div>
+  </div>
+
+<script>
+  // ===== Config =====
+  const UBER_CLIENT_ID = "YOUR_UBER_CLIENT_ID"; // optional; can leave as placeholder
+  const MIN_METERS = 300;
+  const MAX_METERS = 1200;
+
+  // ===== State =====
+  let A = null, B = null, C = null; // {lat,lng,display_name}
+  let lastOriginText = "", lastDestText = "";
+
+  const $ = (id) => document.getElementById(id);
+  const statusEl = $("status");
+  const resultEl = $("result");
+
+  function setStatus(msg) { statusEl.textContent = msg || ""; }
+
+  // Nominatim requires a User-Agent. Browsers don't let you set it directly, so we set a Referer-friendly request.
+  async function geocode(address) {
+    const encoded = encodeURIComponent(address);
+    const url = `https://nominatim.openstreetmap.org/search?q=${encoded}&format=json&limit=1`;
+    const res = await fetch(url, { headers: { "Accept": "application/json" } });
+    if (!res.ok) throw new Error(`Geocoding failed (${res.status})`);
+    const data = await res.json();
+    if (!data.length) throw new Error(`No results for "${address}"`);
+    return { lat: parseFloat(data[0].lat), lng: parseFloat(data[0].lon), display_name: data[0].display_name };
+  }
+
+  async function reverseGeocode(lat, lng) {
+    const url = `https://nominatim.openstreetmap.org/reverse?lat=${encodeURIComponent(lat)}&lon=${encodeURIComponent(lng)}&format=json`;
+    try {
+      const res = await fetch(url, { headers: { "Accept": "application/json" } });
+      if (!res.ok) throw new Error("reverse failed");
+      const data = await res.json();
+      return data.display_name || `${lat.toFixed(5)}, ${lng.toFixed(5)}`;
+    } catch {
+      return `${lat.toFixed(5)}, ${lng.toFixed(5)}`;
+    }
+  }
+
+  function randomNearbyPoint(lat, lng, minMeters = MIN_METERS, maxMeters = MAX_METERS) {
+    const radius = Math.random() * (maxMeters - minMeters) + minMeters;
+    const angle = Math.random() * 2 * Math.PI;
+
+    const dLat = (radius * Math.cos(angle)) / 111320;
+    const dLng = (radius * Math.sin(angle)) / (111320 * Math.cos((lat * Math.PI) / 180));
+
+    return { lat: lat + dLat, lng: lng + dLng, radius };
+  }
+
+  function buildLocationJSON(p, label) {
+    return JSON.stringify({
+      latitude: p.lat,
+      longitude: p.lng,
+      addressLine1: label,
+      addressLine2: p.display_name
+    });
+  }
+
+  function buildUberLegURL(pickup, dropoff) {
+    const params = new URLSearchParams({
+      client_id: UBER_CLIENT_ID,
+      pickup: buildLocationJSON(pickup, "Pickup"),
+      "drop[0]": buildLocationJSON(dropoff, "Dropoff")
+    });
+    return `https://m.uber.com/looking?${params.toString()}`;
+  }
+
+  function buildUberMultiStopURL(pickup, stop1, finalDest) {
+    const params = new URLSearchParams({
+      client_id: UBER_CLIENT_ID,
+      pickup: buildLocationJSON(pickup, "Pickup")
+    });
+    params.append("drop[0]", buildLocationJSON(stop1, "Stop"));
+    params.append("drop[1]", buildLocationJSON(finalDest, "Destination"));
+    return `https://m.uber.com/looking?${params.toString()}`;
+  }
+
+  function openURL(url) {
+    console.log("[Uber URL]", url);
+    window.location.href = url; // iPhone Safari: universal link attempts to open Uber app if installed
+  }
+
+  function render() {
+    if (!A || !B || !C) {
+      resultEl.style.display = "none";
+      $("newStop").disabled = true;
+      return;
+    }
+    resultEl.style.display = "block";
+    $("newStop").disabled = false;
+
+    $("routeText").innerHTML = `
+      <b>Route</b><br/>
+      🟢 <b>A</b> ${A.display_name}<br/>
+      🟠 <b>Stop</b> ${C.display_name}<br/>
+      🔴 <b>B</b> ${B.display_name}
+    `;
+    $("coordsText").textContent =
+      `A: ${A.lat.toFixed(5)}, ${A.lng.toFixed(5)}\n` +
+      `Stop: ${C.lat.toFixed(5)}, ${C.lng.toFixed(5)}\n` +
+      `B: ${B.lat.toFixed(5)}, ${B.lng.toFixed(5)}\n`;
+
+    $("leg1").onclick = () => openURL(buildUberLegURL(A, C));
+    $("leg2").onclick = () => openURL(buildUberLegURL(C, B));
+    $("fullRoute").onclick = () => openURL(buildUberMultiStopURL(A, C, B));
+  }
+
+  async function generateDetour(useSameAB = false) {
+    const originText = $("origin").value.trim();
+    const destText = $("dest").value.trim();
+
+    if (!originText || !destText) {
+      setStatus("Please enter both origin and destination.");
+      return;
+    }
+
+    setStatus("Geocoding origin/destination...");
+    try {
+      if (!useSameAB || originText !== lastOriginText || destText !== lastDestText || !A || !B) {
+        [A, B] = await Promise.all([geocode(originText), geocode(destText)]);
+        lastOriginText = originText;
+        lastDestText = destText;
+      }
+
+      setStatus("Generating random stop near destination...");
+      const { lat, lng, radius } = randomNearbyPoint(B.lat, B.lng);
+      const display = await reverseGeocode(lat, lng);
+      C = { lat, lng, display_name: display, radius };
+
+      console.log("[Detour] A:", A);
+      console.log("[Detour] Stop:", C);
+      console.log("[Detour] B:", B);
+
+      setStatus(`Done. Detour stop ~${Math.round(radius)}m from destination.`);
+      render();
+    } catch (e) {
+      console.error(e);
+      setStatus(e.message || "Something went wrong.");
+    }
+  }
+
+  $("generate").onclick = () => generateDetour(false);
+  $("newStop").onclick = () => generateDetour(true);
+  $("clear").onclick = () => {
+    $("origin").value = "";
+    $("dest").value = "";
+    A = B = C = null;
+    setStatus("");
+    render();
+  };
+</script>
+</body>
+</html>
